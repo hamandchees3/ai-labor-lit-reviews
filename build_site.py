@@ -2,14 +2,35 @@
 """Build a single self-contained index.html for the AI Labor-Market Policy lit reviews.
 
 Renders each lit-reviews/0X-*.md into an HTML tab panel, plus an Overview landing
-page. No server or external assets required — open web/index.html in any browser.
+page. In-text citation keys (e.g. [Schochet2012]) are linked to a per-review
+"References" endnote list parsed from refs/library.bib. No server or external assets
+required — open index.html in any browser.
 """
 import os
+import re
 import markdown
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _find_root(start):
+    """Walk up until we find the project root (has lit-reviews/ and refs/library.bib)."""
+    d = start
+    for _ in range(6):
+        if os.path.isdir(os.path.join(d, "lit-reviews")) and \
+           os.path.isfile(os.path.join(d, "refs", "library.bib")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return start
+
+
+ROOT = _find_root(SCRIPT_DIR)
 LITDIR = os.path.join(ROOT, "lit-reviews")
-OUT = os.path.join(ROOT, "web", "index.html")
+BIB = os.path.join(ROOT, "refs", "library.bib")
+OUT = os.path.join(SCRIPT_DIR, "index.html")  # write next to this script (deployed folder)
 
 # (id, filename, short tab label, full title, section tag, one-line description)
 REVIEWS = [
@@ -39,10 +60,198 @@ REVIEWS = [
 md = markdown.Markdown(extensions=["extra", "sane_lists", "smarty", "toc"])
 
 
+# ---------------------------------------------------------------------------
+# Bibliography: parse refs/library.bib and render in-text citations as links
+# ---------------------------------------------------------------------------
+
+def parse_bibtex(text):
+    """Minimal brace-aware BibTeX parser -> {key: {field: value}}."""
+    # drop %-comment lines (this file uses % for comments)
+    text = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("%"))
+    entries = {}
+    i, n = 0, len(text)
+    while True:
+        at = text.find("@", i)
+        if at < 0:
+            break
+        brace = text.find("{", at)
+        if brace < 0:
+            break
+        depth, j = 0, brace
+        while j < n:
+            c = text[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        body = text[brace + 1:j]
+        i = j + 1
+        comma = body.find(",")
+        if comma < 0:
+            continue
+        key = body[:comma].strip()
+        entries[key] = _parse_fields(body[comma + 1:])
+    return entries
+
+
+def _parse_fields(s):
+    fields, i, n = {}, 0, len(s)
+    while i < n:
+        m = re.match(r"\s*([A-Za-z]+)\s*=\s*", s[i:])
+        if not m:
+            break
+        name = m.group(1).lower()
+        i += m.end()
+        if i < n and s[i] == "{":
+            depth, j = 0, i
+            while j < n:
+                if s[j] == "{":
+                    depth += 1
+                elif s[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            val = s[i + 1:j]
+            i = j + 1
+        elif i < n and s[i] == '"':
+            j = i + 1
+            while j < n and s[j] != '"':
+                j += 1
+            val = s[i + 1:j]
+            i = j + 1
+        else:
+            m2 = re.match(r"[^,]+", s[i:])
+            val = m2.group(0).strip() if m2 else ""
+            i += m2.end() if m2 else 1
+        fields[name] = re.sub(r"\s+", " ", val).strip()
+        m3 = re.match(r"\s*,\s*", s[i:])
+        if m3:
+            i += m3.end()
+    return fields
+
+
+def _clean(x):
+    return re.sub(r"[{}]", "", x).strip() if x else ""
+
+
+def _esc(x):
+    return (x.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def format_reference(fields):
+    """Return (html, url) for a bib entry's formatted reference string."""
+    author = _clean(fields.get("author") or fields.get("organization") or "")
+    if author:
+        author = "; ".join(p.strip() for p in re.split(r"\s+and\s+", author))
+    year = _clean(fields.get("year"))
+    title = _clean(fields.get("title"))
+    url = (fields.get("url") or "").strip()
+    doi = _clean(fields.get("doi"))
+    if not url and doi:
+        url = "https://doi.org/" + doi
+    venue = ""
+    for f in ("journal", "booktitle", "institution", "publisher", "howpublished", "school"):
+        if fields.get(f):
+            venue = _clean(fields[f])
+            break
+    vol, num, pages = _clean(fields.get("volume")), _clean(fields.get("number")), _clean(fields.get("pages"))
+
+    bits = []
+    if author:
+        bits.append(_esc(author) + ("" if author.endswith(".") else "."))
+    if year:
+        bits.append("(%s)." % _esc(year))
+    if title:
+        t = _esc(title)
+        if not t.endswith((".", "?", "!")):
+            t += "."
+        bits.append('<span class="ref-title">%s</span>' % t)
+    if venue:
+        v = '<span class="ref-venue">%s</span>' % _esc(venue)
+        det = ""
+        if vol:
+            det += " " + _esc(vol)
+        if num:
+            det += "(%s)" % _esc(num)
+        if pages:
+            det += ", " + _esc(pages)
+        bits.append(v + det + ".")
+    return " ".join(bits), url
+
+
+CITE_RE = re.compile(r"\[([^\[\]\n]+)\]")
+_CITELIKE = re.compile(r"^[A-Za-z][\w.:\-]*\d{2,4}[a-z]?$|^[A-Z][A-Za-z]+_[\w.\-]+$")
+
+
+def linkify_citations(text, rid, keyset, seen, order, unresolved):
+    """Replace [Key] / [Key1; Key2] in markdown source with anchor links.
+
+    Only tokens present in keyset are linked; groups with no known keys are left
+    untouched (so [speculative — ...] etc. survive). The first occurrence of each
+    key gets an id so the reference list can link back to it.
+    """
+    def repl(m):
+        toks = [t.strip() for t in m.group(1).split(";")]
+        if not any(t in keyset for t in toks):
+            for t in toks:  # record citation-looking-but-unknown tokens
+                if t not in keyset and _CITELIKE.match(t):
+                    unresolved.add(t)
+            return m.group(0)
+        out = []
+        for t in toks:
+            if t in keyset:
+                if t not in seen:
+                    seen.add(t)
+                    order.append(t)
+                    idattr = ' id="ref-%s-%s-1"' % (rid, t)
+                else:
+                    idattr = ""
+                out.append('<a class="citelink"%s href="#cite-%s-%s">%s</a>'
+                           % (idattr, rid, t, _esc(t)))
+            else:
+                if _CITELIKE.match(t):
+                    unresolved.add(t)
+                out.append(_esc(t))
+        return "[" + "; ".join(out) + "]"
+
+    return CITE_RE.sub(repl, text)
+
+
+def references_html(rid, order, bib):
+    if not order:
+        return ""
+    items = []
+    for key in sorted(order, key=str.lower):
+        html, url = format_reference(bib[key])
+        src = (' <a class="ref-src" href="%s" target="_blank" rel="noopener" title="open source">&#8599;</a>' % _esc(url)) if url else ""
+        back = ' <a class="ref-back" href="#ref-%s-%s-1" title="back to text">&#8617;</a>' % (rid, key)
+        items.append('<li id="cite-%s-%s"><span class="ref-key">[%s]</span> %s%s%s</li>'
+                     % (rid, key, _esc(key), html, src, back))
+    return ('<h2 class="ref-head">References</h2>'
+            '<p class="ref-note">%d sources cited in this review. '
+            'In-text keys link here; &#8617; returns to the text.</p>'
+            '<ul class="refs">%s</ul>' % (len(order), "".join(items)))
+
+
 def render_md(path):
     md.reset()
     with open(path, encoding="utf-8") as f:
         return md.convert(f.read())
+
+
+def render_review(path, rid, bib, keyset, unresolved):
+    """Render a review: linkify citations in source, convert, append references."""
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    seen, order = set(), []
+    src = linkify_citations(src, rid, keyset, seen, order, unresolved)
+    md.reset()
+    body = md.convert(src)
+    return body + references_html(rid, order, bib)
 
 
 CSS = """
@@ -136,6 +345,33 @@ main{max-width:var(--maxw); margin:0 auto; padding:0 22px 90px}
   padding:1px 5px; font:14px/1 ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 .doc em em{font-style:normal}
+/* citations + references */
+.doc a.citelink{
+  color:var(--accent); text-decoration:none; border-bottom:1px dotted var(--accent);
+  font-family:ui-sans-serif,system-ui,sans-serif; font-size:.92em;
+  font-variant-numeric:tabular-nums; white-space:nowrap; padding:0 1px;
+}
+.doc a.citelink:hover{background:var(--accent-soft); border-bottom-style:solid}
+.doc h2.ref-head{margin-top:2.4em}
+.doc .ref-note{
+  font:13px/1.5 ui-sans-serif,system-ui,sans-serif; color:var(--faint); margin:-.2em 0 1.1em;
+}
+.doc ul.refs{
+  list-style:none; padding-left:0; margin:.4em 0 0;
+  font:14px/1.55 ui-sans-serif,system-ui,sans-serif;
+}
+.doc ul.refs li{
+  margin:0 0 .75em; padding:4px 8px 4px 1.5em; text-indent:-1.1em;
+  color:var(--muted); border-radius:5px; scroll-margin-top:64px;
+}
+.doc ul.refs li:target{background:var(--accent-soft)}
+.doc ul.refs li::marker{content:none}
+.ref-key{font-weight:600; color:var(--ink); margin-right:2px}
+.ref-title{color:var(--ink)}
+.ref-venue{font-style:italic}
+.doc a.ref-src,.doc a.ref-back{border:none; text-decoration:none; color:var(--accent); font-size:.95em}
+.doc a.ref-src:hover,.doc a.ref-back:hover{color:var(--ink)}
+.citelink:target,[id^="ref-"]:target{background:var(--accent-soft); border-radius:3px}
 /* overview */
 .lede{font-size:19px; line-height:1.6; color:var(--ink); margin:0 0 1.3em}
 .twocol{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:1.6em 0 2.2em}
@@ -228,6 +464,11 @@ def overview_html():
 
 
 def build():
+    with open(BIB, encoding="utf-8") as f:
+        bib = parse_bibtex(f.read())
+    keyset = set(bib)
+    unresolved = set()
+
     tab_btns = ['<button data-target="overview" aria-selected="true">Overview</button>']
     panels = [f'<section class="panel active" id="overview">{overview_html()}</section>']
     for rid, fname, short, title, tag, desc in REVIEWS:
@@ -237,7 +478,7 @@ def build():
             f'<button data-target="review-{rid}"{internal_attr}>'
             f'<span class="num">{rid}</span>{short}</button>'
         )
-        body = render_md(os.path.join(LITDIR, fname))
+        body = render_review(os.path.join(LITDIR, fname), rid, bib, keyset, unresolved)
         warn = " warn" if internal else ""
         meta = (f'<div class="meta"><span class="pill{warn}">{tag}</span>'
                 f'<span class="pill{warn}">Review {rid}</span></div>')
@@ -269,6 +510,12 @@ def build():
     with open(OUT, "w", encoding="utf-8") as f:
         f.write(doc)
     print(f"wrote {OUT} ({len(doc):,} bytes)")
+    print(f"bibliography: {len(bib)} entries parsed from {os.path.relpath(BIB, SCRIPT_DIR)}")
+    if unresolved:
+        print(f"WARNING: {len(unresolved)} in-text citation key(s) not found in library.bib "
+              f"(left unlinked): {', '.join(sorted(unresolved))}")
+    else:
+        print("all citation-like in-text keys resolved to a bibliography entry")
 
 
 if __name__ == "__main__":
